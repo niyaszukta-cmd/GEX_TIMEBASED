@@ -1,63 +1,80 @@
-# ============================================================================
-# ADVANCED GEX + DEX ANALYSIS - MODIFIED VERSION
-# WITH UPDATED GEX FLOW LOGIC & ATM STRADDLE CHART
-# ============================================================================
+"""
+================================================================================
+NYZTrade - Enhanced GEX + DEX Calculator
+================================================================================
+Complete calculator with:
+- Proper Groww.in futures price fetching
+- NSE Option Chain data
+- Black-Scholes Greeks calculation
+- GEX/DEX computation
+- Flow metrics analysis
+- Gamma flip detection
 
-# STEP 1: INSTALL REQUIRED LIBRARIES
-# ----------------------------------------------------------------------------
-# !pip install requests pandas numpy plotly scipy tabulate -q
+Author: NYZTrade
+================================================================================
+"""
 
 import requests
 import pandas as pd
 import numpy as np
+import re
 import json
-from datetime import datetime
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+from datetime import datetime, timedelta
 from scipy.stats import norm
-from tabulate import tabulate
 import warnings
 import time
-from IPython.display import clear_output, HTML
+
 warnings.filterwarnings('ignore')
 
-print("✅ Libraries imported successfully!")
-print("="*80)
 
 # ============================================================================
-# BLACK-SCHOLES CALCULATOR (GAMMA + DELTA)
+# BLACK-SCHOLES CALCULATOR
 # ============================================================================
 
 class BlackScholesCalculator:
-    """Calculate accurate gamma and delta using Black-Scholes formula"""
-
+    """Calculate option Greeks using Black-Scholes model"""
+    
     @staticmethod
     def calculate_d1(S, K, T, r, sigma):
-        """Calculate d1 for Black-Scholes"""
+        """Calculate d1 parameter"""
+        if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+            return 0
+        try:
+            d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+            return d1
+        except:
+            return 0
+
+    @staticmethod
+    def calculate_d2(S, K, T, r, sigma):
+        """Calculate d2 parameter"""
         if T <= 0 or sigma <= 0:
             return 0
-        return (np.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma * np.sqrt(T))
+        try:
+            d1 = BlackScholesCalculator.calculate_d1(S, K, T, r, sigma)
+            d2 = d1 - sigma * np.sqrt(T)
+            return d2
+        except:
+            return 0
 
     @staticmethod
     def calculate_gamma(S, K, T, r, sigma):
-        """Calculate Black-Scholes Gamma"""
+        """Calculate option gamma"""
         if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
             return 0
-
         try:
             d1 = BlackScholesCalculator.calculate_d1(S, K, T, r, sigma)
             n_prime_d1 = norm.pdf(d1)
             gamma = n_prime_d1 / (S * sigma * np.sqrt(T))
             return gamma
-        except Exception as e:
+        except:
             return 0
 
     @staticmethod
     def calculate_call_delta(S, K, T, r, sigma):
-        """Calculate Call Delta = N(d1)"""
+        """Calculate call option delta"""
         if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
             return 0
-
         try:
             d1 = BlackScholesCalculator.calculate_d1(S, K, T, r, sigma)
             return norm.cdf(d1)
@@ -66,384 +83,449 @@ class BlackScholesCalculator:
 
     @staticmethod
     def calculate_put_delta(S, K, T, r, sigma):
-        """Calculate Put Delta = N(d1) - 1"""
+        """Calculate put option delta"""
         if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
             return 0
-
         try:
             d1 = BlackScholesCalculator.calculate_d1(S, K, T, r, sigma)
             return norm.cdf(d1) - 1
         except:
             return 0
 
+    @staticmethod
+    def calculate_vega(S, K, T, r, sigma):
+        """Calculate option vega"""
+        if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+            return 0
+        try:
+            d1 = BlackScholesCalculator.calculate_d1(S, K, T, r, sigma)
+            vega = S * norm.pdf(d1) * np.sqrt(T) / 100
+            return vega
+        except:
+            return 0
+
+
 # ============================================================================
-# ENHANCED NSE DATA FETCHER WITH GEX + DEX CALCULATIONS
+# GROWW FUTURES FETCHER
 # ============================================================================
 
-class EnhancedGEXDEXCalculator:
-    """Advanced GEX + DEX calculations with improved futures fetching"""
-
+class GrowwFuturesFetcher:
+    """Fetch futures price from Groww.in"""
+    
     def __init__(self):
+        self.base_url = "https://groww.in"
+        self.api_base = "https://groww.in/v1/api/stocks_fo_data/v1"
+        
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'application/json, text/plain, */*',
             'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Referer': 'https://www.nseindia.com/',
+            'Origin': 'https://groww.in',
+            'Referer': 'https://groww.in/derivatives',
         }
-
-        self.session = requests.Session()
-        self.session.headers.update(self.headers)
-        self.base_url = "https://www.nseindia.com"
-        self.option_chain_url = "https://www.nseindia.com/api/option-chain-indices"
-        self.risk_free_rate = 0.07
-        self.bs_calc = BlackScholesCalculator()
-
-        # Initialize session
+        
+        # Symbol mapping for Groww
+        self.symbol_map = {
+            'NIFTY': {'groww': 'NIFTY', 'display': 'NIFTY 50'},
+            'BANKNIFTY': {'groww': 'BANKNIFTY', 'display': 'BANK NIFTY'},
+            'FINNIFTY': {'groww': 'FINNIFTY', 'display': 'FIN NIFTY'},
+            'MIDCPNIFTY': {'groww': 'MIDCPNIFTY', 'display': 'MIDCAP NIFTY'}
+        }
+    
+    def get_futures_price(self, symbol, expiry_date=None):
+        """
+        Fetch futures price from Groww.in
+        
+        Args:
+            symbol: Index symbol (NIFTY, BANKNIFTY, etc.)
+            expiry_date: Expiry date string (DD-MMM-YYYY format)
+        
+        Returns:
+            tuple: (futures_price, fetch_method) or (None, error_message)
+        """
+        
+        groww_symbol = self.symbol_map.get(symbol, {}).get('groww', symbol)
+        
+        # Method 1: Try Groww Derivatives API
+        price = self._fetch_from_derivatives_api(groww_symbol, expiry_date)
+        if price:
+            return price, "Groww API"
+        
+        # Method 2: Try Groww Futures page scraping
+        price = self._fetch_from_futures_page(groww_symbol)
+        if price:
+            return price, "Groww Page"
+        
+        # Method 3: Try alternate Groww endpoint
+        price = self._fetch_from_contract_api(groww_symbol, expiry_date)
+        if price:
+            return price, "Groww Contract"
+        
+        return None, "Groww fetch failed"
+    
+    def _fetch_from_derivatives_api(self, symbol, expiry_date=None):
+        """Fetch from Groww derivatives API"""
         try:
-            self.session.get(self.base_url, timeout=10)
-            print("✅ Connected to NSE")
-        except:
-            print("⚠️ NSE connection initialized")
-
-    def fetch_futures_ltp_method1(self, symbol, expiry_date=None):
-        """Method 1: Fetch from Groww.in (Most reliable!)"""
-        try:
-            symbol_map = {
-                'NIFTY': 'nifty',
-                'BANKNIFTY': 'bank-nifty',
-                'FINNIFTY': 'finnifty',
-                'MIDCPNIFTY': 'midcpnifty'
-            }
-
-            groww_symbol = symbol_map.get(symbol, 'nifty')
-            url = f"https://groww.in/futures/{groww_symbol}"
-
-            print(f"   Fetching from Groww: {url}")
-
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none',
-                'Cache-Control': 'max-age=0'
-            }
-
-            response = self.session.get(url, headers=headers, timeout=15)
-
+            # Get futures chain
+            url = f"{self.api_base}/derivatives/futures/contracts/{symbol}"
+            
+            response = requests.get(url, headers=self.headers, timeout=10)
+            
             if response.status_code == 200:
-                html_content = response.text
-                import re
-
-                script_patterns = [
-                    r'"ltp":\s*([0-9.]+)',
-                    r'"lastPrice":\s*([0-9.]+)',
-                    r'"close":\s*([0-9.]+)',
-                    r'"currentPrice":\s*([0-9.]+)',
-                    r'ltp.*?([0-9]{5,6}\.[0-9]{1,2})',
+                data = response.json()
+                
+                # Find current month futures
+                if isinstance(data, list) and len(data) > 0:
+                    # Get first (current) contract
+                    contract = data[0]
+                    if 'ltp' in contract:
+                        return float(contract['ltp'])
+                    if 'lastPrice' in contract:
+                        return float(contract['lastPrice'])
+                
+                # If dict response
+                if isinstance(data, dict):
+                    if 'ltp' in data:
+                        return float(data['ltp'])
+                    if 'lastPrice' in data:
+                        return float(data['lastPrice'])
+                    
+                    # Check for contracts array
+                    contracts = data.get('contracts', data.get('futuresContracts', []))
+                    if contracts and len(contracts) > 0:
+                        # Find matching expiry or use first
+                        for contract in contracts:
+                            if expiry_date and contract.get('expiryDate') == expiry_date:
+                                return float(contract.get('ltp', contract.get('lastPrice', 0)))
+                        
+                        # Use first contract
+                        first = contracts[0]
+                        return float(first.get('ltp', first.get('lastPrice', 0)))
+            
+            return None
+        except Exception as e:
+            return None
+    
+    def _fetch_from_futures_page(self, symbol):
+        """Scrape futures price from Groww futures page"""
+        try:
+            url = f"{self.base_url}/futures/{symbol.lower()}"
+            
+            response = requests.get(url, headers=self.headers, timeout=10)
+            
+            if response.status_code == 200:
+                # Try to extract price from page content
+                patterns = [
+                    r'"ltp"\s*:\s*([0-9]+\.?[0-9]*)',
+                    r'"lastPrice"\s*:\s*([0-9]+\.?[0-9]*)',
+                    r'"close"\s*:\s*([0-9]+\.?[0-9]*)',
+                    r'"currentPrice"\s*:\s*([0-9]+\.?[0-9]*)',
+                    r'data-ltp="([0-9]+\.?[0-9]*)"',
+                    r'price.*?([0-9]{4,6}\.[0-9]{1,2})',
                 ]
-
-                for pattern in script_patterns:
-                    matches = re.findall(pattern, html_content)
+                
+                for pattern in patterns:
+                    matches = re.findall(pattern, response.text)
                     if matches:
                         for match in matches:
                             price = float(match)
-                            if symbol == 'NIFTY' and 15000 < price < 35000:
-                                print(f"   ✅ Found futures LTP: {price}")
-                                return price, expiry_date
-                            elif symbol == 'BANKNIFTY' and 35000 < price < 60000:
-                                print(f"   ✅ Found futures LTP: {price}")
-                                return price, expiry_date
-                            elif symbol == 'FINNIFTY' and 15000 < price < 30000:
-                                print(f"   ✅ Found futures LTP: {price}")
-                                return price, expiry_date
-
-                api_url = f"https://groww.in/v1/api/stocks_fo_data/v1/tr_live_prices/exchange/NSE/segment/FO/latest/{symbol}FUT"
-                try:
-                    api_response = self.session.get(api_url, headers=headers, timeout=10)
-                    if api_response.status_code == 200:
-                        api_data = api_response.json()
-                        if 'ltp' in api_data:
-                            price = float(api_data['ltp'])
-                            print(f"   ✅ Found futures LTP via API: {price}")
-                            return price, expiry_date
-                except:
-                    pass
-
-            return None, None
+                            # Validate price range
+                            if self._validate_price(symbol, price):
+                                return price
+            
+            return None
         except Exception as e:
-            print(f"   Groww method failed: {e}")
-            return None, None
-
-    def fetch_futures_ltp_method2(self, symbol, spot_price, expiry_date):
-        """Method 2: Calculate from ATM options using Put-Call Parity"""
+            return None
+    
+    def _fetch_from_contract_api(self, symbol, expiry_date=None):
+        """Fetch from Groww contract-specific API"""
         try:
-            print(f"   Method 2: Calculating from ATM options...")
-            url = f"{self.option_chain_url}?symbol={symbol}"
-            response = self.session.get(url, timeout=10)
-
+            # Try getting the current month expiry contract
+            url = f"{self.api_base}/contract/stock/{symbol}"
+            
+            response = requests.get(url, headers=self.headers, timeout=10)
+            
             if response.status_code == 200:
                 data = response.json()
-                records = data['records']
-
-                atm_strike = None
-                min_diff = float('inf')
-
-                for item in records.get('data', []):
-                    if expiry_date and item.get('expiryDate') != expiry_date:
-                        continue
-
-                    strike = item.get('strikePrice', 0)
-                    diff = abs(strike - spot_price)
-
-                    if diff < min_diff:
-                        min_diff = diff
-                        atm_strike = strike
-
-                if atm_strike:
-                    for item in records.get('data', []):
-                        if item.get('strikePrice') == atm_strike:
-                            if expiry_date and item.get('expiryDate') != expiry_date:
-                                continue
-
-                            ce = item.get('CE', {})
-                            pe = item.get('PE', {})
-
-                            call_ltp = ce.get('lastPrice', 0)
-                            put_ltp = pe.get('lastPrice', 0)
-
-                            if call_ltp > 0 and put_ltp > 0:
-                                futures_price = atm_strike + call_ltp - put_ltp
-                                print(f"   ✅ ATM Strike: {atm_strike}, Call: {call_ltp}, Put: {put_ltp}")
-                                print(f"   ✅ Calculated Futures: {futures_price:.2f}")
-                                return futures_price, expiry_date
-
-            return None, None
+                
+                if 'ltp' in data:
+                    return float(data['ltp'])
+                
+                # Try futures specific endpoint
+                futures_data = data.get('futures', {})
+                if futures_data:
+                    contracts = futures_data.get('contracts', [])
+                    if contracts:
+                        return float(contracts[0].get('ltp', 0))
+            
+            return None
         except Exception as e:
-            print(f"   Method 2 failed: {e}")
-            return None, None
+            return None
+    
+    def _validate_price(self, symbol, price):
+        """Validate if price is within expected range"""
+        ranges = {
+            'NIFTY': (20000, 30000),
+            'BANKNIFTY': (45000, 60000),
+            'FINNIFTY': (20000, 28000),
+            'MIDCPNIFTY': (10000, 16000)
+        }
+        min_p, max_p = ranges.get(symbol.upper(), (5000, 100000))
+        return min_p < price < max_p
 
-    def fetch_futures_ltp_method3(self, symbol, spot_price, days_to_expiry):
-        """Method 3: Theoretical futures price using cost of carry"""
+
+# ============================================================================
+# NSE DATA FETCHER
+# ============================================================================
+
+class NSEDataFetcher:
+    """Fetch option chain data from NSE India"""
+    
+    def __init__(self):
+        self.base_url = "https://www.nseindia.com"
+        self.option_chain_url = "https://www.nseindia.com/api/option-chain-indices"
+        
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Cache-Control': 'max-age=0',
+        }
+        
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+        self.cookies_set = False
+
+    def initialize_session(self):
+        """Initialize session with NSE website"""
         try:
-            print(f"   Method 3: Cost of carry calculation...")
-            T = days_to_expiry / 365.0
-            futures_price = spot_price * np.exp(self.risk_free_rate * T)
-            print(f"   ✅ Theoretical Futures (Cost of Carry): {futures_price:.2f}")
-            return futures_price, None
+            response = self.session.get(self.base_url, timeout=10, allow_redirects=True)
+            
+            if response.status_code == 200:
+                self.session.headers.update({
+                    'Accept': 'application/json, text/plain, */*',
+                    'Referer': 'https://www.nseindia.com/option-chain',
+                    'X-Requested-With': 'XMLHttpRequest',
+                })
+                self.cookies_set = True
+                time.sleep(0.5)
+                return True, "Session initialized"
+            else:
+                return False, f"Status {response.status_code}"
+                
         except Exception as e:
-            print(f"   Method 3 failed: {e}")
-            return None, None
+            return False, str(e)
 
-    def fetch_futures_ltp_comprehensive(self, symbol, spot_price, expiry_date, days_to_expiry):
-        """Comprehensive futures fetching with multiple fallback methods"""
-        print("\n" + "="*80)
-        print("🔍 FETCHING INDEX FUTURES LTP - TRYING MULTIPLE METHODS...")
-        print("="*80)
+    def fetch_option_chain(self, symbol="NIFTY"):
+        """Fetch option chain data from NSE"""
+        if not self.cookies_set:
+            success, msg = self.initialize_session()
+            if not success:
+                return None, msg
+        
+        try:
+            url = f"{self.option_chain_url}?symbol={symbol}"
+            response = self.session.get(url, timeout=15)
+            
+            if response.status_code == 401:
+                self.cookies_set = False
+                success, msg = self.initialize_session()
+                if success:
+                    response = self.session.get(url, timeout=15)
+                else:
+                    return None, msg
+            
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    if 'records' in data:
+                        return data, None
+                    else:
+                        return None, "Invalid response format"
+                except json.JSONDecodeError:
+                    return None, "JSON decode error"
+            else:
+                return None, f"HTTP {response.status_code}"
+                
+        except requests.exceptions.Timeout:
+            return None, "Timeout"
+        except Exception as e:
+            return None, str(e)
 
-        print("\n🔄 Method 1: Fetching from Groww.in...")
-        futures_ltp, futures_expiry = self.fetch_futures_ltp_method1(symbol, expiry_date)
+    def get_contract_specs(self, symbol):
+        """Get contract specifications"""
+        specs = {
+            'NIFTY': {'lot_size': 25, 'strike_interval': 50},
+            'BANKNIFTY': {'lot_size': 15, 'strike_interval': 100},
+            'FINNIFTY': {'lot_size': 40, 'strike_interval': 50},
+            'MIDCPNIFTY': {'lot_size': 75, 'strike_interval': 25}
+        }
+        return specs.get(symbol, specs['NIFTY'])
 
-        if futures_ltp and futures_ltp > 0:
-            print(f"✅ SUCCESS - Method 1 (Groww.in) worked!")
-            return futures_ltp, futures_expiry, "Groww.in"
 
-        print("\n🔄 Method 2: Calculating from ATM options (Put-Call Parity)...")
-        futures_ltp, futures_expiry = self.fetch_futures_ltp_method2(symbol, spot_price, expiry_date)
+# ============================================================================
+# ENHANCED GEX DEX CALCULATOR
+# ============================================================================
 
-        if futures_ltp and futures_ltp > 0:
-            print(f"✅ SUCCESS - Method 2 (Put-Call Parity) worked!")
-            return futures_ltp, futures_expiry, "Put-Call Parity"
+class EnhancedGEXDEXCalculator:
+    """
+    Enhanced GEX + DEX Calculator with:
+    - Groww.in futures fetching
+    - NSE option chain data
+    - Multiple expiry support
+    - Proper Greeks calculation
+    """
+    
+    def __init__(self):
+        self.nse_fetcher = NSEDataFetcher()
+        self.groww_fetcher = GrowwFuturesFetcher()
+        self.bs_calc = BlackScholesCalculator()
+        self.risk_free_rate = 0.07
+        self.use_demo_data = False
 
-        print("\n🔄 Method 3: Theoretical calculation (Cost of Carry)...")
-        futures_ltp, _ = self.fetch_futures_ltp_method3(symbol, spot_price, days_to_expiry)
-
-        if futures_ltp and futures_ltp > 0:
-            print(f"✅ SUCCESS - Method 3 (Cost of Carry) worked!")
-            return futures_ltp, expiry_date, "Cost of Carry Model"
-
-        print("\n⚠️ All methods failed - Using SPOT price as fallback")
-        return spot_price, expiry_date, "Spot (Fallback)"
-
-    def calculate_time_to_expiry(self, expiry_date_str):
+    def calculate_time_to_expiry(self, expiry_str):
         """Calculate time to expiry in years"""
         try:
-            expiry_date = datetime.strptime(expiry_date_str, "%d-%b-%Y")
-            today = datetime.now()
-            days_to_expiry = (expiry_date - today).days
-            time_to_expiry = max(days_to_expiry / 365, 0.001)
-            return time_to_expiry, days_to_expiry
+            expiry = datetime.strptime(expiry_str, "%d-%b-%Y")
+            days = (expiry - datetime.now()).days
+            T = max(days / 365, 1/365)
+            return T, max(days, 1)
         except:
             return 7/365, 7
 
-    def fetch_and_calculate_gex_dex(self, symbol="NIFTY", strikes_range=10, expiry_index=0):
+    def fetch_and_calculate_gex_dex(self, symbol="NIFTY", strikes_range=12, expiry_index=0):
         """
-        Fetch option chain and calculate both GEX and DEX
+        Main function to fetch data and calculate GEX/DEX
+        
+        Args:
+            symbol: Index symbol
+            strikes_range: Number of strikes on each side of ATM
+            expiry_index: 0=Current Weekly, 1=Next Weekly, 2=Monthly
+        
+        Returns:
+            tuple: (df, futures_ltp, fetch_method, atm_info)
         """
+        
+        # Initialize NSE session
+        success, msg = self.nse_fetcher.initialize_session()
+        if not success:
+            self.use_demo_data = True
+            return self._generate_demo_data(symbol, strikes_range)
+        
+        # Fetch option chain
+        data, error = self.nse_fetcher.fetch_option_chain(symbol)
+        
+        if error or not data:
+            self.use_demo_data = True
+            return self._generate_demo_data(symbol, strikes_range)
+        
         try:
-            print(f"\n🔄 Fetching live {symbol} data...")
-
-            url = f"{self.option_chain_url}?symbol={symbol}"
-            response = self.session.get(url, timeout=10)
-
-            if response.status_code != 200:
-                print(f"❌ Failed to fetch data. Status: {response.status_code}")
-                return None, None, None, None
-
-            data = response.json()
             records = data['records']
-
             spot_price = records.get('underlyingValue', 0)
-            timestamp = records.get('timestamp', '')
+            timestamp = records.get('timestamp', datetime.now().strftime('%d-%b-%Y %H:%M:%S'))
             expiry_dates = records.get('expiryDates', [])
-
-            print(f"📍 Underlying Spot Price: {spot_price:,.2f}")
-            print(f"🕒 Last Updated: {timestamp}")
-
-            if expiry_dates:
-                print(f"\n📅 Available Expiries ({len(expiry_dates)} total):")
-                for idx, exp_date in enumerate(expiry_dates[:5]):
-                    marker = "👉" if idx == expiry_index else "  "
-                    print(f"   {marker} [{idx}] {exp_date}")
-
-            if not expiry_dates:
-                selected_expiry = None
-                time_to_expiry = 7/365
-                days_to_expiry = 7
-            elif expiry_index >= len(expiry_dates):
-                selected_expiry = expiry_dates[0]
-                time_to_expiry, days_to_expiry = self.calculate_time_to_expiry(selected_expiry)
-            else:
-                selected_expiry = expiry_dates[expiry_index]
-                time_to_expiry, days_to_expiry = self.calculate_time_to_expiry(selected_expiry)
-
-            print(f"\n✅ Selected Expiry: {selected_expiry}")
-            print(f"⏰ Days to Expiry: {days_to_expiry}")
-
-            futures_ltp, futures_expiry, fetch_method = self.fetch_futures_ltp_comprehensive(
-                symbol, spot_price, selected_expiry, days_to_expiry
-            )
-
-            basis = futures_ltp - spot_price
-            basis_pct = (basis / spot_price * 100) if spot_price > 0 else 0
-
-            print("\n" + "="*80)
-            print("💰 PRICE COMPARISON & FUTURES DETAILS:")
-            print("="*80)
-            print(f"📊 Underlying Spot:        {spot_price:>15,.2f}")
-            print(f"🔥 Index Futures LTP:      {futures_ltp:>15,.2f}  ⬅️ USING THIS!")
-            print(f"📈 Basis (F - S):          {basis:>15,.2f}  ({basis_pct:+.3f}%)")
-            print(f"🔧 Fetch Method:           {fetch_method:>15}")
-            print(f"📅 Futures Expiry:         {futures_expiry if futures_expiry else 'N/A':>15}")
-            print("="*80)
-
-            reference_price = futures_ltp
-
-            # Contract specifications
-            if 'BANKNIFTY' in symbol:
-                contract_size = 15
-                strike_interval = 100
-            elif 'FINNIFTY' in symbol:
-                contract_size = 40
-                strike_interval = 50
-            elif 'MIDCPNIFTY' in symbol:
-                contract_size = 75
-                strike_interval = 25
-            else:
-                contract_size = 25
-                strike_interval = 50
-
-            # Process strikes data
+            
+            if not expiry_dates or spot_price == 0:
+                return self._generate_demo_data(symbol, strikes_range)
+            
+            # Select expiry based on index
+            # 0 = Current Weekly, 1 = Next Weekly, 2 = Monthly (usually last Thursday)
+            selected_expiry = expiry_dates[min(expiry_index, len(expiry_dates) - 1)]
+            
+            T, days_to_expiry = self.calculate_time_to_expiry(selected_expiry)
+            
+            # Get futures price from Groww.in
+            futures_ltp, fetch_method = self.groww_fetcher.get_futures_price(symbol, selected_expiry)
+            
+            # Fallback methods if Groww fails
+            if futures_ltp is None:
+                # Try Put-Call Parity
+                futures_ltp = self._calculate_futures_from_pcp(records, spot_price, selected_expiry)
+                if futures_ltp:
+                    fetch_method = "Put-Call Parity"
+                else:
+                    # Cost of Carry model
+                    futures_ltp = spot_price * np.exp(self.risk_free_rate * days_to_expiry / 365)
+                    fetch_method = "Cost of Carry"
+            
+            # Get contract specs
+            specs = self.nse_fetcher.get_contract_specs(symbol)
+            lot_size = specs['lot_size']
+            strike_interval = specs['strike_interval']
+            
+            # Process option chain data
             all_strikes = []
-            processed_strikes = set()
+            processed = set()
             atm_strike = None
-            min_atm_diff = float('inf')
+            min_diff = float('inf')
             atm_call_premium = 0
             atm_put_premium = 0
-
+            
             for item in records.get('data', []):
-                if selected_expiry and item.get('expiryDate') != selected_expiry:
+                if item.get('expiryDate') != selected_expiry:
                     continue
-
+                
                 strike = item.get('strikePrice', 0)
-                if strike == 0 or strike in processed_strikes:
+                if strike == 0 or strike in processed:
                     continue
-
-                processed_strikes.add(strike)
-
-                strike_distance = abs(strike - reference_price) / strike_interval
-                if strike_distance > strikes_range:
+                
+                processed.add(strike)
+                
+                # Filter by strikes range
+                distance = abs(strike - futures_ltp) / strike_interval
+                if distance > strikes_range:
                     continue
-
+                
                 ce = item.get('CE', {})
                 pe = item.get('PE', {})
-
-                call_oi = ce.get('openInterest', 0)
-                put_oi = pe.get('openInterest', 0)
-                call_oi_change = ce.get('changeinOpenInterest', 0)
-                put_oi_change = pe.get('changeinOpenInterest', 0)
-                call_volume = ce.get('totalTradedVolume', 0)
-                put_volume = pe.get('totalTradedVolume', 0)
-                call_iv = ce.get('impliedVolatility', 0)
-                put_iv = pe.get('impliedVolatility', 0)
-                call_ltp = ce.get('lastPrice', 0)
-                put_ltp = pe.get('lastPrice', 0)
-
-                # Find ATM strike
-                strike_diff = abs(strike - reference_price)
-                if strike_diff < min_atm_diff:
-                    min_atm_diff = strike_diff
+                
+                # Extract data
+                call_oi = ce.get('openInterest', 0) or 0
+                put_oi = pe.get('openInterest', 0) or 0
+                call_oi_change = ce.get('changeinOpenInterest', 0) or 0
+                put_oi_change = pe.get('changeinOpenInterest', 0) or 0
+                call_volume = ce.get('totalTradedVolume', 0) or 0
+                put_volume = pe.get('totalTradedVolume', 0) or 0
+                call_iv = ce.get('impliedVolatility', 0) or 15
+                put_iv = pe.get('impliedVolatility', 0) or 15
+                call_ltp = ce.get('lastPrice', 0) or 0
+                put_ltp = pe.get('lastPrice', 0) or 0
+                
+                # Track ATM strike
+                diff = abs(strike - futures_ltp)
+                if diff < min_diff:
+                    min_diff = diff
                     atm_strike = strike
                     atm_call_premium = call_ltp
                     atm_put_premium = put_ltp
-
-                call_iv_decimal = call_iv / 100 if call_iv > 0 else 0.15
-                put_iv_decimal = put_iv / 100 if put_iv > 0 else 0.15
-
-                # Calculate Gammas
-                call_gamma = self.bs_calc.calculate_gamma(
-                    S=reference_price, K=strike, T=time_to_expiry,
-                    r=self.risk_free_rate, sigma=call_iv_decimal
-                )
-
-                put_gamma = self.bs_calc.calculate_gamma(
-                    S=reference_price, K=strike, T=time_to_expiry,
-                    r=self.risk_free_rate, sigma=put_iv_decimal
-                )
-
-                # Calculate Deltas
-                call_delta = self.bs_calc.calculate_call_delta(
-                    S=reference_price, K=strike, T=time_to_expiry,
-                    r=self.risk_free_rate, sigma=call_iv_decimal
-                )
-
-                put_delta = self.bs_calc.calculate_put_delta(
-                    S=reference_price, K=strike, T=time_to_expiry,
-                    r=self.risk_free_rate, sigma=put_iv_decimal
-                )
-
+                
+                # Calculate Greeks
+                call_iv_dec = max(call_iv / 100, 0.05)
+                put_iv_dec = max(put_iv / 100, 0.05)
+                
+                call_gamma = self.bs_calc.calculate_gamma(futures_ltp, strike, T, self.risk_free_rate, call_iv_dec)
+                put_gamma = self.bs_calc.calculate_gamma(futures_ltp, strike, T, self.risk_free_rate, put_iv_dec)
+                call_delta = self.bs_calc.calculate_call_delta(futures_ltp, strike, T, self.risk_free_rate, call_iv_dec)
+                put_delta = self.bs_calc.calculate_put_delta(futures_ltp, strike, T, self.risk_free_rate, put_iv_dec)
+                
                 # Calculate GEX (in Billions)
-                call_gex = (call_oi * call_gamma * reference_price * reference_price * contract_size) / 1_000_000_000
-                put_gex = -(put_oi * put_gamma * reference_price * reference_price * contract_size) / 1_000_000_000
-
+                gex_mult = futures_ltp * futures_ltp * lot_size / 1_000_000_000
+                call_gex = call_oi * call_gamma * gex_mult
+                put_gex = -put_oi * put_gamma * gex_mult
+                
                 # Calculate DEX (in Billions)
-                call_dex = (call_oi * call_delta * reference_price * contract_size) / 1_000_000_000
-                put_dex = (put_oi * put_delta * reference_price * contract_size) / 1_000_000_000
-
-                # Flow GEX
-                call_flow_gex = (call_oi_change * call_gamma * reference_price * reference_price * contract_size) / 1_000_000_000
-                put_flow_gex = -(put_oi_change * put_gamma * reference_price * reference_price * contract_size) / 1_000_000_000
-
-                # Flow DEX
-                call_flow_dex = (call_oi_change * call_delta * reference_price * contract_size) / 1_000_000_000
-                put_flow_dex = (put_oi_change * put_delta * reference_price * contract_size) / 1_000_000_000
-
+                dex_mult = futures_ltp * lot_size / 1_000_000_000
+                call_dex = call_oi * call_delta * dex_mult
+                put_dex = put_oi * put_delta * dex_mult
+                
+                # Flow calculations
+                call_flow_gex = call_oi_change * call_gamma * gex_mult
+                put_flow_gex = -put_oi_change * put_gamma * gex_mult
+                call_flow_dex = call_oi_change * call_delta * dex_mult
+                put_flow_dex = put_oi_change * put_delta * dex_mult
+                
                 all_strikes.append({
                     'Strike': strike,
                     'Call_OI': call_oi,
@@ -473,943 +555,425 @@ class EnhancedGEXDEXCalculator:
                     'Put_Flow_DEX': put_flow_dex,
                     'Net_Flow_DEX': call_flow_dex + put_flow_dex
                 })
-
+            
             if not all_strikes:
-                print("❌ No strikes data found")
-                return None, None, None, None
-
-            df = pd.DataFrame(all_strikes)
-            df = df.sort_values('Strike').reset_index(drop=True)
-
-            df['Call_GEX_B'] = df['Call_GEX']
-            df['Put_GEX_B'] = df['Put_GEX']
-            df['Net_GEX_B'] = df['Net_GEX']
-            df['Call_DEX_B'] = df['Call_DEX']
-            df['Put_DEX_B'] = df['Put_DEX']
-            df['Net_DEX_B'] = df['Net_DEX']
-            df['Call_Flow_GEX_B'] = df['Call_Flow_GEX']
-            df['Put_Flow_GEX_B'] = df['Put_Flow_GEX']
-            df['Net_Flow_GEX_B'] = df['Net_Flow_GEX']
-            df['Call_Flow_DEX_B'] = df['Call_Flow_DEX']
-            df['Put_Flow_DEX_B'] = df['Put_Flow_DEX']
-            df['Net_Flow_DEX_B'] = df['Net_Flow_DEX']
+                return self._generate_demo_data(symbol, strikes_range)
+            
+            # Create DataFrame
+            df = pd.DataFrame(all_strikes).sort_values('Strike').reset_index(drop=True)
+            
+            # Add _B suffix columns
+            for col in ['Call_GEX', 'Put_GEX', 'Net_GEX', 'Call_DEX', 'Put_DEX', 'Net_DEX',
+                        'Call_Flow_GEX', 'Put_Flow_GEX', 'Net_Flow_GEX',
+                        'Call_Flow_DEX', 'Put_Flow_DEX', 'Net_Flow_DEX']:
+                df[f'{col}_B'] = df[col]
+            
             df['Total_Volume'] = df['Call_Volume'] + df['Put_Volume']
-
-            # Fixed: Ensure scalar division
-            max_net_gex = df['Net_GEX_B'].abs().max()
-            if max_net_gex > 0:
-                df['Hedging_Pressure'] = (df['Net_GEX_B'] / max_net_gex) * 100
-            else:
-                df['Hedging_Pressure'] = 0
-
-            # Calculate ATM Straddle
-            atm_straddle_premium = atm_call_premium + atm_put_premium
-
-            print(f"✅ Processed {len(df)} strikes")
-            print(f"📊 Total Net GEX: {df['Net_GEX_B'].sum():.4f} B")
-            print(f"📊 Total Net DEX: {df['Net_DEX_B'].sum():.4f} B")
-            print(f"🎯 ATM Strike: {atm_strike}")
-            print(f"💰 ATM Straddle Premium: ₹{atm_straddle_premium:.2f}")
-
-            # Return ATM info as dictionary
+            df['Total_OI'] = df['Call_OI'] + df['Put_OI']
+            
+            # Hedging Pressure
+            max_gex = df['Net_GEX_B'].abs().max()
+            df['Hedging_Pressure'] = (df['Net_GEX_B'] / max_gex * 100) if max_gex > 0 else 0
+            
+            # ATM info
             atm_info = {
-                'atm_strike': atm_strike,
+                'atm_strike': atm_strike or df.iloc[len(df)//2]['Strike'],
                 'atm_call_premium': atm_call_premium,
                 'atm_put_premium': atm_put_premium,
-                'atm_straddle_premium': atm_straddle_premium
+                'atm_straddle_premium': atm_call_premium + atm_put_premium,
+                'spot_price': spot_price,
+                'expiry_date': selected_expiry,
+                'days_to_expiry': days_to_expiry,
+                'timestamp': timestamp,
+                'expiry_index': expiry_index,
+                'all_expiries': expiry_dates
             }
-
-            return df, reference_price, fetch_method, atm_info
-
+            
+            return df, futures_ltp, fetch_method, atm_info
+            
         except Exception as e:
-            print(f"❌ Error: {e}")
-            import traceback
-            traceback.print_exc()
-            return None, None, None, None
+            return self._generate_demo_data(symbol, strikes_range)
+
+    def _calculate_futures_from_pcp(self, records, spot_price, expiry_date):
+        """Calculate synthetic futures from Put-Call Parity"""
+        try:
+            atm_strike = None
+            min_diff = float('inf')
+            ce_data = None
+            pe_data = None
+            
+            for item in records.get('data', []):
+                if item.get('expiryDate') != expiry_date:
+                    continue
+                
+                strike = item.get('strikePrice', 0)
+                diff = abs(strike - spot_price)
+                
+                if diff < min_diff:
+                    min_diff = diff
+                    atm_strike = strike
+                    ce_data = item.get('CE', {})
+                    pe_data = item.get('PE', {})
+            
+            if atm_strike and ce_data and pe_data:
+                call_price = ce_data.get('lastPrice', 0)
+                put_price = pe_data.get('lastPrice', 0)
+                
+                if call_price > 0 and put_price > 0:
+                    # F = K + (C - P) for near-term
+                    futures = atm_strike + (call_price - put_price)
+                    return futures
+            
+            return None
+        except:
+            return None
+
+    def _generate_demo_data(self, symbol="NIFTY", strikes_range=12):
+        """Generate demo data when live data unavailable"""
+        np.random.seed(int(datetime.now().timestamp()) % 10000)
+        
+        spot_prices = {
+            'NIFTY': 24250 + np.random.randn() * 50,
+            'BANKNIFTY': 51850 + np.random.randn() * 100,
+            'FINNIFTY': 23150 + np.random.randn() * 50,
+            'MIDCPNIFTY': 12450 + np.random.randn() * 25
+        }
+        
+        spot_price = spot_prices.get(symbol, 24250)
+        specs = self.nse_fetcher.get_contract_specs(symbol)
+        lot_size = specs['lot_size']
+        strike_interval = specs['strike_interval']
+        
+        futures_ltp = spot_price * 1.0008
+        atm_strike = round(spot_price / strike_interval) * strike_interval
+        T = 7 / 365
+        
+        all_strikes = []
+        
+        for i in range(-strikes_range, strikes_range + 1):
+            strike = atm_strike + (i * strike_interval)
+            dist = abs(i)
+            
+            base_oi = 400000 + np.random.randint(-100000, 100000)
+            if i < 0:
+                call_oi = int(base_oi * (0.4 + 0.2 * np.random.random()) * max(0.2, 1 - dist * 0.08))
+                put_oi = int(base_oi * (1.1 + 0.3 * np.random.random()) * max(0.3, 1 - dist * 0.05))
+            else:
+                call_oi = int(base_oi * (1.1 + 0.3 * np.random.random()) * max(0.3, 1 - dist * 0.05))
+                put_oi = int(base_oi * (0.4 + 0.2 * np.random.random()) * max(0.2, 1 - dist * 0.08))
+            
+            call_oi_change = int((np.random.random() - 0.5) * call_oi * 0.15)
+            put_oi_change = int((np.random.random() - 0.5) * put_oi * 0.15)
+            call_volume = int(call_oi * (0.05 + 0.1 * np.random.random()))
+            put_volume = int(put_oi * (0.05 + 0.1 * np.random.random()))
+            
+            base_iv = 13 + dist * 0.35 + np.random.random() * 1.5
+            call_iv = base_iv + (0.8 if i > 0 else -0.3)
+            put_iv = base_iv + (0.8 if i < 0 else -0.3)
+            
+            if strike < spot_price:
+                call_ltp = max(5, spot_price - strike + np.random.random() * 20)
+                put_ltp = max(1, np.random.random() * 30 * max(0.1, 1 - dist * 0.12))
+            else:
+                call_ltp = max(1, np.random.random() * 30 * max(0.1, 1 - dist * 0.12))
+                put_ltp = max(5, strike - spot_price + np.random.random() * 20)
+            
+            call_iv_dec = call_iv / 100
+            put_iv_dec = put_iv / 100
+            
+            call_gamma = self.bs_calc.calculate_gamma(futures_ltp, strike, T, self.risk_free_rate, call_iv_dec)
+            put_gamma = self.bs_calc.calculate_gamma(futures_ltp, strike, T, self.risk_free_rate, put_iv_dec)
+            call_delta = self.bs_calc.calculate_call_delta(futures_ltp, strike, T, self.risk_free_rate, call_iv_dec)
+            put_delta = self.bs_calc.calculate_put_delta(futures_ltp, strike, T, self.risk_free_rate, put_iv_dec)
+            
+            gex_mult = futures_ltp * futures_ltp * lot_size / 1_000_000_000
+            dex_mult = futures_ltp * lot_size / 1_000_000_000
+            
+            call_gex = call_oi * call_gamma * gex_mult
+            put_gex = -put_oi * put_gamma * gex_mult
+            call_dex = call_oi * call_delta * dex_mult
+            put_dex = put_oi * put_delta * dex_mult
+            
+            call_flow_gex = call_oi_change * call_gamma * gex_mult
+            put_flow_gex = -put_oi_change * put_gamma * gex_mult
+            call_flow_dex = call_oi_change * call_delta * dex_mult
+            put_flow_dex = put_oi_change * put_delta * dex_mult
+            
+            all_strikes.append({
+                'Strike': strike,
+                'Call_OI': call_oi, 'Put_OI': put_oi,
+                'Call_OI_Change': call_oi_change, 'Put_OI_Change': put_oi_change,
+                'Call_Volume': call_volume, 'Put_Volume': put_volume,
+                'Call_IV': round(call_iv, 2), 'Put_IV': round(put_iv, 2),
+                'Call_LTP': round(call_ltp, 2), 'Put_LTP': round(put_ltp, 2),
+                'Call_Gamma': call_gamma, 'Put_Gamma': put_gamma,
+                'Call_Delta': call_delta, 'Put_Delta': put_delta,
+                'Call_GEX': call_gex, 'Put_GEX': put_gex, 'Net_GEX': call_gex + put_gex,
+                'Call_DEX': call_dex, 'Put_DEX': put_dex, 'Net_DEX': call_dex + put_dex,
+                'Call_Flow_GEX': call_flow_gex, 'Put_Flow_GEX': put_flow_gex, 'Net_Flow_GEX': call_flow_gex + put_flow_gex,
+                'Call_Flow_DEX': call_flow_dex, 'Put_Flow_DEX': put_flow_dex, 'Net_Flow_DEX': call_flow_dex + put_flow_dex
+            })
+        
+        df = pd.DataFrame(all_strikes).sort_values('Strike').reset_index(drop=True)
+        
+        for col in ['Call_GEX', 'Put_GEX', 'Net_GEX', 'Call_DEX', 'Put_DEX', 'Net_DEX',
+                    'Call_Flow_GEX', 'Put_Flow_GEX', 'Net_Flow_GEX',
+                    'Call_Flow_DEX', 'Put_Flow_DEX', 'Net_Flow_DEX']:
+            df[f'{col}_B'] = df[col]
+        
+        df['Total_Volume'] = df['Call_Volume'] + df['Put_Volume']
+        df['Total_OI'] = df['Call_OI'] + df['Put_OI']
+        
+        max_gex = df['Net_GEX_B'].abs().max()
+        df['Hedging_Pressure'] = (df['Net_GEX_B'] / max_gex * 100) if max_gex > 0 else 0
+        
+        atm_row = df[df['Strike'] == atm_strike]
+        if len(atm_row) > 0:
+            atm_row = atm_row.iloc[0]
+        else:
+            atm_row = df.iloc[len(df)//2]
+        
+        # Next Thursday for expiry
+        today = datetime.now()
+        days_to_thu = (3 - today.weekday()) % 7
+        if days_to_thu == 0:
+            days_to_thu = 7
+        next_thu = today + timedelta(days=days_to_thu)
+        
+        atm_info = {
+            'atm_strike': atm_strike,
+            'atm_call_premium': atm_row['Call_LTP'],
+            'atm_put_premium': atm_row['Put_LTP'],
+            'atm_straddle_premium': atm_row['Call_LTP'] + atm_row['Put_LTP'],
+            'spot_price': round(spot_price, 2),
+            'expiry_date': next_thu.strftime("%d-%b-%Y"),
+            'days_to_expiry': days_to_thu,
+            'timestamp': datetime.now().strftime('%d-%b-%Y %H:%M:%S'),
+            'expiry_index': 0,
+            'all_expiries': [next_thu.strftime("%d-%b-%Y")]
+        }
+        
+        return df, round(futures_ltp, 2), "Demo Data", atm_info
+
 
 # ============================================================================
-# MODIFIED GEX + DEX FLOW CALCULATION
+# FLOW METRICS CALCULATION - UPDATED TERMINOLOGY
 # ============================================================================
 
 def calculate_dual_gex_dex_flow(df, futures_ltp):
     """
-    MODIFIED: Calculate GEX flow based on 5 positive + 5 negative strikes closest to spot
+    Calculate comprehensive GEX and DEX flow metrics
+    
+    Updated Terminology:
+    - Positive GEX = "Volatility Dampening" (MMs buy dips, sell rallies)
+    - Negative GEX = "Volatility Amplifying" (MMs amplify moves)
     """
     df_unique = df.drop_duplicates(subset=['Strike']).sort_values('Strike').reset_index(drop=True)
-
-    # ===== NEW GEX FLOW LOGIC =====
-    # Get strikes with positive Net GEX, sorted by distance from spot
-    positive_gex_df = df_unique[df_unique['Net_GEX_B'] > 0].copy()
-    positive_gex_df['Distance'] = abs(positive_gex_df['Strike'] - futures_ltp)
-    positive_gex_df = positive_gex_df.sort_values('Distance').head(5)
-
-    # Get strikes with negative Net GEX, sorted by distance from spot
-    negative_gex_df = df_unique[df_unique['Net_GEX_B'] < 0].copy()
-    negative_gex_df['Distance'] = abs(negative_gex_df['Strike'] - futures_ltp)
-    negative_gex_df = negative_gex_df.sort_values('Distance').head(5)
-
-    # Calculate flows
-    gex_near_positive = float(positive_gex_df['Net_GEX_B'].sum()) if len(positive_gex_df) > 0 else 0.0
-    gex_near_negative = float(negative_gex_df['Net_GEX_B'].sum()) if len(negative_gex_df) > 0 else 0.0
-    gex_near_total = gex_near_positive + gex_near_negative
-
-    # Total GEX (all strikes)
-    positive_gex_mask = df_unique['Net_GEX_B'] > 0
-    negative_gex_mask = df_unique['Net_GEX_B'] < 0
-
-    gex_total_positive = float(df_unique.loc[positive_gex_mask, 'Net_GEX_B'].sum()) if positive_gex_mask.any() else 0.0
-    gex_total_negative = float(df_unique.loc[negative_gex_mask, 'Net_GEX_B'].sum()) if negative_gex_mask.any() else 0.0
-    gex_total_all = gex_total_positive + gex_total_negative
-
-    # ===== DEX FLOW (keep same as before) =====
-    above_futures = df_unique[df_unique['Strike'] > futures_ltp].head(5)
-    below_futures = df_unique[df_unique['Strike'] < futures_ltp].tail(5)
-
-    dex_near_positive = float(above_futures['Net_DEX_B'].sum()) if len(above_futures) > 0 else 0.0
-    dex_near_negative = float(below_futures['Net_DEX_B'].sum()) if len(below_futures) > 0 else 0.0
-    dex_near_total = dex_near_positive + dex_near_negative
-
-    positive_dex_mask = df_unique['Net_DEX_B'] > 0
-    negative_dex_mask = df_unique['Net_DEX_B'] < 0
-
-    dex_total_positive = float(df_unique.loc[positive_dex_mask, 'Net_DEX_B'].sum()) if positive_dex_mask.any() else 0.0
-    dex_total_negative = float(df_unique.loc[negative_dex_mask, 'Net_DEX_B'].sum()) if negative_dex_mask.any() else 0.0
-    dex_total_all = dex_total_positive + dex_total_negative
-
-    # ===== MODIFIED BIAS LOGIC =====
-    def get_gex_bias(flow_value):
-        """MODIFIED: Positive GEX = Sideways/Bullish, Negative GEX = Bearish/Volatile"""
-        if flow_value > 50:
-            return "🟢 STRONG BULLISH (Sideways to Bullish)", "green"
-        elif flow_value > 0:
-            return "🟢 BULLISH (Sideways to Bullish)", "lightgreen"
-        elif flow_value < -50:
-            return "🔴 STRONG BEARISH (High Volatility)", "red"
-        elif flow_value < 0:
-            return "🔴 BEARISH (High Volatility)", "lightcoral"
+    
+    # GEX Flow - 5 positive + 5 negative closest to spot
+    pos_gex = df_unique[df_unique['Net_GEX_B'] > 0].copy()
+    if len(pos_gex) > 0:
+        pos_gex['Dist'] = abs(pos_gex['Strike'] - futures_ltp)
+        pos_gex = pos_gex.nsmallest(5, 'Dist')
+    
+    neg_gex = df_unique[df_unique['Net_GEX_B'] < 0].copy()
+    if len(neg_gex) > 0:
+        neg_gex['Dist'] = abs(neg_gex['Strike'] - futures_ltp)
+        neg_gex = neg_gex.nsmallest(5, 'Dist')
+    
+    gex_near_pos = float(pos_gex['Net_GEX_B'].sum()) if len(pos_gex) > 0 else 0
+    gex_near_neg = float(neg_gex['Net_GEX_B'].sum()) if len(neg_gex) > 0 else 0
+    gex_near_total = gex_near_pos + gex_near_neg
+    
+    gex_total_pos = float(df_unique[df_unique['Net_GEX_B'] > 0]['Net_GEX_B'].sum())
+    gex_total_neg = float(df_unique[df_unique['Net_GEX_B'] < 0]['Net_GEX_B'].sum())
+    gex_total_all = gex_total_pos + gex_total_neg
+    
+    # DEX Flow
+    above = df_unique[df_unique['Strike'] > futures_ltp].head(5)
+    below = df_unique[df_unique['Strike'] < futures_ltp].tail(5)
+    
+    dex_near_pos = float(above['Net_DEX_B'].sum()) if len(above) > 0 else 0
+    dex_near_neg = float(below['Net_DEX_B'].sum()) if len(below) > 0 else 0
+    dex_near_total = dex_near_pos + dex_near_neg
+    
+    dex_total_pos = float(df_unique[df_unique['Net_DEX_B'] > 0]['Net_DEX_B'].sum())
+    dex_total_neg = float(df_unique[df_unique['Net_DEX_B'] < 0]['Net_DEX_B'].sum())
+    dex_total_all = dex_total_pos + dex_total_neg
+    
+    # Key Levels
+    max_call_oi_strike = df_unique.loc[df_unique['Call_OI'].idxmax(), 'Strike'] if len(df_unique) > 0 else 0
+    max_put_oi_strike = df_unique.loc[df_unique['Put_OI'].idxmax(), 'Strike'] if len(df_unique) > 0 else 0
+    max_gex_strike = df_unique.loc[df_unique['Net_GEX_B'].abs().idxmax(), 'Strike'] if len(df_unique) > 0 else 0
+    
+    # PCR
+    total_call_oi = df_unique['Call_OI'].sum()
+    total_put_oi = df_unique['Put_OI'].sum()
+    pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 1
+    
+    # ==========================================
+    # UPDATED BIAS TERMINOLOGY
+    # ==========================================
+    # Positive GEX = Volatility Dampening (market makers stabilize)
+    # Negative GEX = Volatility Amplifying (market makers amplify moves)
+    
+    def get_gex_bias(val, threshold=50):
+        """Get GEX bias with volatility terminology"""
+        if val > threshold:
+            return "🟢 STRONG VOL DAMPENING", "#00d4aa"
+        elif val > 0:
+            return "🟢 VOL DAMPENING", "#55efc4"
+        elif val < -threshold:
+            return "🔴 STRONG VOL AMPLIFYING", "#ff6b6b"
+        elif val < 0:
+            return "🔴 VOL AMPLIFYING", "#fab1a0"
+        return "⚪ NEUTRAL", "#b2bec3"
+    
+    def get_dex_bias(val, threshold=50):
+        """Get DEX bias - directional bias"""
+        if val > threshold:
+            return "🟢 STRONG BULLISH", "#00d4aa"
+        elif val > 0:
+            return "🟢 BULLISH", "#55efc4"
+        elif val < -threshold:
+            return "🔴 STRONG BEARISH", "#ff6b6b"
+        elif val < 0:
+            return "🔴 BEARISH", "#fab1a0"
+        return "⚪ NEUTRAL", "#b2bec3"
+    
+    def get_combined_bias(gex_val, dex_val):
+        """Get combined bias"""
+        combined = (gex_val + dex_val) / 2
+        
+        # GEX dominant scenarios
+        if gex_val > 50:
+            if dex_val > 20:
+                return "🟢 DAMPENING + BULLISH", "#00d4aa"
+            elif dex_val < -20:
+                return "🟡 DAMPENING + BEARISH", "#ffeaa7"
+            else:
+                return "🟢 VOL DAMPENING", "#55efc4"
+        elif gex_val < -50:
+            if dex_val > 20:
+                return "⚡ AMPLIFYING + BULLISH", "#fd79a8"
+            elif dex_val < -20:
+                return "🔴 AMPLIFYING + BEARISH", "#ff6b6b"
+            else:
+                return "🔴 VOL AMPLIFYING", "#fab1a0"
         else:
-            return "⚖️ NEUTRAL", "orange"
-
-    def get_dex_bias(flow_value):
-        """DEX bias (unchanged)"""
-        if flow_value > 50:
-            return "🟢 BULLISH", "green"
-        elif flow_value < -50:
-            return "🔴 BEARISH", "red"
-        elif flow_value > 0:
-            return "🟢 Mild Bullish", "lightgreen"
-        elif flow_value < 0:
-            return "🔴 Mild Bearish", "lightcoral"
-        else:
-            return "⚖️ NEUTRAL", "orange"
-
-    gex_near_bias, gex_near_color = get_gex_bias(gex_near_total)
-    gex_total_bias, gex_total_color = get_gex_bias(gex_total_all)
-    dex_near_bias, dex_near_color = get_dex_bias(dex_near_total)
-    dex_total_bias, dex_total_color = get_dex_bias(dex_total_all)
-
-    # Combined directional signal
-    combined_signal = (gex_near_total + dex_near_total) / 2
-    combined_bias, combined_color = get_gex_bias(combined_signal)
-
+            if dex_val > 30:
+                return "🟢 BULLISH BIAS", "#55efc4"
+            elif dex_val < -30:
+                return "🔴 BEARISH BIAS", "#fab1a0"
+            return "⚪ NEUTRAL", "#b2bec3"
+    
+    gex_bias, gex_color = get_gex_bias(gex_near_total)
+    dex_bias, dex_color = get_dex_bias(dex_near_total)
+    combined_bias, combined_color = get_combined_bias(gex_near_total, dex_near_total)
+    
     return {
-        # GEX metrics
-        'gex_near_positive': gex_near_positive,
-        'gex_near_negative': gex_near_negative,
+        'gex_near_positive': gex_near_pos,
+        'gex_near_negative': gex_near_neg,
         'gex_near_total': gex_near_total,
-        'gex_near_bias': gex_near_bias,
-        'gex_near_color': gex_near_color,
-        'gex_total_positive': gex_total_positive,
-        'gex_total_negative': gex_total_negative,
+        'gex_total_positive': gex_total_pos,
+        'gex_total_negative': gex_total_neg,
         'gex_total_all': gex_total_all,
-        'gex_total_bias': gex_total_bias,
-        'gex_total_color': gex_total_color,
-
-        # DEX metrics
-        'dex_near_positive': dex_near_positive,
-        'dex_near_negative': dex_near_negative,
+        'gex_near_bias': gex_bias,
+        'gex_near_color': gex_color,
+        'dex_near_positive': dex_near_pos,
+        'dex_near_negative': dex_near_neg,
         'dex_near_total': dex_near_total,
-        'dex_near_bias': dex_near_bias,
-        'dex_near_color': dex_near_color,
-        'dex_total_positive': dex_total_positive,
-        'dex_total_negative': dex_total_negative,
+        'dex_total_positive': dex_total_pos,
+        'dex_total_negative': dex_total_neg,
         'dex_total_all': dex_total_all,
-        'dex_total_bias': dex_total_bias,
-        'dex_total_color': dex_total_color,
-
-        # Combined
-        'combined_signal': combined_signal,
+        'dex_near_bias': dex_bias,
+        'dex_near_color': dex_color,
+        'combined_signal': (gex_near_total + dex_near_total) / 2,
         'combined_bias': combined_bias,
         'combined_color': combined_color,
-
-        # Store strike lists for reference
-        'positive_gex_strikes': positive_gex_df['Strike'].tolist() if len(positive_gex_df) > 0 else [],
-        'negative_gex_strikes': negative_gex_df['Strike'].tolist() if len(negative_gex_df) > 0 else [],
-        'above_strikes': above_futures['Strike'].tolist(),
-        'below_strikes': below_futures['Strike'].tolist(),
+        'max_call_oi_strike': max_call_oi_strike,
+        'max_put_oi_strike': max_put_oi_strike,
+        'max_gex_strike': max_gex_strike,
+        'pcr': pcr,
+        'total_call_oi': total_call_oi,
+        'total_put_oi': total_put_oi
     }
 
-# ============================================================================
-# ENHANCED VISUALIZATION WITH 7 CHARTS (ADDED ATM STRADDLE)
-# ============================================================================
-
-def create_enhanced_dashboard(df, futures_ltp, symbol, flow_metrics, fetch_method, atm_info):
-    """Enhanced dashboard with GEX + DEX + ATM Straddle analysis"""
-
-    fig = make_subplots(
-        rows=4, cols=2,
-        subplot_titles=(
-            '📊 Net GEX Profile with Volume',
-            '📈 Delta Exposure (DEX) Profile with Volume',
-            '🔄 GEX Flow (OI Changes) with Volume',
-            '📉 DEX Flow with Volume',
-            '🎯 Hedging Pressure Index with Volume',
-            '⚡ Combined GEX+DEX Directional Bias',
-            '💰 ATM Straddle Analysis',
-            ''  # Empty subplot
-        ),
-        specs=[[{"type": "xy"}, {"type": "xy"}],
-               [{"type": "xy"}, {"type": "xy"}],
-               [{"type": "xy"}, {"type": "xy"}],
-               [{"type": "xy", "colspan": 2}, None]],
-        vertical_spacing=0.10, horizontal_spacing=0.12,
-        row_heights=[0.25, 0.25, 0.25, 0.25]
-    )
-
-    # Prepare volume scaling for all charts
-    max_gex = df['Net_GEX_B'].abs().max()
-    max_dex = df['Net_DEX_B'].abs().max()
-    max_vol = df['Total_Volume'].max()
-
-    if max_vol > 0:
-        vol_scale_gex = (max_gex * 0.3) / max_vol
-        vol_scale_dex = (max_dex * 0.3) / max_vol
-        scaled_volume_gex = df['Total_Volume'] * vol_scale_gex
-        scaled_volume_dex = df['Total_Volume'] * vol_scale_dex
-    else:
-        scaled_volume_gex = df['Total_Volume']
-        scaled_volume_dex = df['Total_Volume']
-
-    # Get S&R levels
-    positive_gex_mask = df['Net_GEX_B'] > 0
-    positive_gex = df[positive_gex_mask].nlargest(3, 'Net_GEX_B')
-
-    negative_gex_mask = df['Net_GEX_B'] < 0
-    negative_gex = df[negative_gex_mask].nsmallest(3, 'Net_GEX_B')
-
-    # ========================================================================
-    # CHART 1: Net GEX Profile with Volume
-    # ========================================================================
-    colors = ['green' if x > 0 else 'red' for x in df['Net_GEX_B']]
-    fig.add_trace(go.Bar(y=df['Strike'], x=df['Net_GEX_B'], name='Net GEX',
-                         orientation='h', marker_color=colors,
-                         hovertemplate='<b>Strike:</b> %{y}<br><b>Net GEX:</b> %{x:.4f} B<extra></extra>'),
-                  row=1, col=1)
-
-    fig.add_trace(go.Scatter(y=df['Strike'], x=scaled_volume_gex, name='Volume',
-                             mode='lines+markers', line=dict(color='blue', width=2),
-                             marker=dict(size=4),
-                             hovertemplate='<b>Strike:</b> %{y}<br><b>Volume:</b> %{customdata:,.0f}<extra></extra>',
-                             customdata=df['Total_Volume']), row=1, col=1)
-
-    fig.add_hline(y=futures_ltp, line_dash="dash", line_color="blue",
-                  line_width=3, annotation_text="FUTURES", row=1, col=1)
-
-    # Add S&R lines
-    for idx, (_, row) in enumerate(positive_gex.iterrows()):
-        if row['Strike'] < futures_ltp:
-            fig.add_hline(y=row['Strike'], line_dash="dot", line_color="green",
-                         line_width=1, opacity=0.5, annotation_text=f"S{idx+1}",
-                         annotation_position="left", row=1, col=1)
-        elif row['Strike'] > futures_ltp:
-            fig.add_hline(y=row['Strike'], line_dash="dot", line_color="red",
-                         line_width=1, opacity=0.5, annotation_text=f"R{idx+1}",
-                         annotation_position="right", row=1, col=1)
-
-    # ========================================================================
-    # CHART 2: DEX Profile with Volume
-    # ========================================================================
-    dex_colors = ['green' if x > 0 else 'red' for x in df['Net_DEX_B']]
-    fig.add_trace(go.Bar(y=df['Strike'], x=df['Net_DEX_B'], name='Net DEX',
-                         orientation='h', marker_color=dex_colors,
-                         hovertemplate='<b>Strike:</b> %{y}<br><b>Net DEX:</b> %{x:.4f} B<extra></extra>'),
-                  row=1, col=2)
-
-    fig.add_trace(go.Scatter(y=df['Strike'], x=scaled_volume_dex, name='Volume',
-                             mode='lines+markers', line=dict(color='purple', width=2),
-                             marker=dict(size=4),
-                             hovertemplate='<b>Strike:</b> %{y}<br><b>Volume:</b> %{customdata:,.0f}<extra></extra>',
-                             customdata=df['Total_Volume']), row=1, col=2)
-
-    fig.add_hline(y=futures_ltp, line_dash="dash", line_color="blue",
-                  line_width=3, annotation_text="FUTURES", row=1, col=2)
-
-    # ========================================================================
-    # CHART 3: GEX Flow with Volume
-    # ========================================================================
-    flow_colors = ['green' if x > 0 else 'red' for x in df['Net_Flow_GEX_B']]
-    fig.add_trace(go.Bar(y=df['Strike'], x=df['Net_Flow_GEX_B'], name='GEX Flow',
-                         orientation='h', marker_color=flow_colors,
-                         hovertemplate='<b>Strike:</b> %{y}<br><b>Flow GEX:</b> %{x:.4f} B<extra></extra>'),
-                  row=2, col=1)
-
-    max_flow = df['Net_Flow_GEX_B'].abs().max()
-    vol_scale_flow = (max_flow * 0.3) / max_vol if max_vol > 0 else 1
-    scaled_volume_flow = df['Total_Volume'] * vol_scale_flow
-
-    fig.add_trace(go.Scatter(y=df['Strike'], x=scaled_volume_flow, name='Volume',
-                             mode='lines+markers', line=dict(color='orange', width=2),
-                             marker=dict(size=4),
-                             hovertemplate='<b>Strike:</b> %{y}<br><b>Volume:</b> %{customdata:,.0f}<extra></extra>',
-                             customdata=df['Total_Volume']), row=2, col=1)
-
-    fig.add_hline(y=futures_ltp, line_dash="dash", line_color="blue",
-                  line_width=3, annotation_text="FUTURES", row=2, col=1)
-
-    # ========================================================================
-    # CHART 4: DEX Flow with Volume
-    # ========================================================================
-    dex_flow_colors = ['green' if x > 0 else 'red' for x in df['Net_Flow_DEX_B']]
-    fig.add_trace(go.Bar(y=df['Strike'], x=df['Net_Flow_DEX_B'], name='DEX Flow',
-                         orientation='h', marker_color=dex_flow_colors,
-                         hovertemplate='<b>Strike:</b> %{y}<br><b>Flow DEX:</b> %{x:.4f} B<extra></extra>'),
-                  row=2, col=2)
-
-    max_dex_flow = df['Net_Flow_DEX_B'].abs().max()
-    vol_scale_dex_flow = (max_dex_flow * 0.3) / max_vol if max_vol > 0 else 1
-    scaled_volume_dex_flow = df['Total_Volume'] * vol_scale_dex_flow
-
-    fig.add_trace(go.Scatter(y=df['Strike'], x=scaled_volume_dex_flow, name='Volume',
-                             mode='lines+markers', line=dict(color='cyan', width=2),
-                             marker=dict(size=4),
-                             hovertemplate='<b>Strike:</b> %{y}<br><b>Volume:</b> %{customdata:,.0f}<extra></extra>',
-                             customdata=df['Total_Volume']), row=2, col=2)
-
-    fig.add_hline(y=futures_ltp, line_dash="dash", line_color="blue",
-                  line_width=3, annotation_text="FUTURES", row=2, col=2)
-
-    # ========================================================================
-    # CHART 5: Hedging Pressure with Volume
-    # ========================================================================
-    fig.add_trace(go.Bar(y=df['Strike'], x=df['Hedging_Pressure'], orientation='h',
-                         marker=dict(color=df['Hedging_Pressure'], colorscale='RdYlGn',
-                                   showscale=True, colorbar=dict(title="Pressure", x=1.15)),
-                         name='Hedge Pressure',
-                         hovertemplate='<b>Strike:</b> %{y}<br><b>Pressure:</b> %{x:.2f}<extra></extra>'),
-                  row=3, col=1)
-
-    max_pressure = df['Hedging_Pressure'].abs().max()
-    vol_scale_pressure = (max_pressure * 0.3) / max_vol if max_vol > 0 else 1
-    scaled_volume_pressure = df['Total_Volume'] * vol_scale_pressure
-
-    fig.add_trace(go.Scatter(y=df['Strike'], x=scaled_volume_pressure, name='Volume',
-                             mode='lines+markers', line=dict(color='magenta', width=2),
-                             marker=dict(size=4),
-                             hovertemplate='<b>Strike:</b> %{y}<br><b>Volume:</b> %{customdata:,.0f}<extra></extra>',
-                             customdata=df['Total_Volume']), row=3, col=1)
-
-    fig.add_hline(y=futures_ltp, line_dash="dash", line_color="blue",
-                  line_width=3, annotation_text="FUTURES", row=3, col=1)
-
-    # ========================================================================
-    # CHART 6: Combined GEX+DEX Bias
-    # ========================================================================
-    df['Combined_Signal'] = (df['Net_GEX_B'] + df['Net_DEX_B']) / 2
-    combined_colors = ['green' if x > 0 else 'red' for x in df['Combined_Signal']]
-
-    fig.add_trace(go.Bar(y=df['Strike'], x=df['Combined_Signal'], orientation='h',
-                         marker_color=combined_colors, name='Combined Signal',
-                         hovertemplate='<b>Strike:</b> %{y}<br><b>Combined:</b> %{x:.4f} B<extra></extra>'),
-                  row=3, col=2)
-
-    fig.add_trace(go.Scatter(y=df['Strike'], x=df['Net_Flow_DEX_B'],
-                             name='DEX Flow Curve',
-                             mode='lines', line=dict(color='yellow', width=3, dash='dash'),
-                             hovertemplate='<b>Strike:</b> %{y}<br><b>DEX Flow:</b> %{x:.4f} B<extra></extra>'),
-                  row=3, col=2)
-
-    fig.add_hline(y=futures_ltp, line_dash="dash", line_color="blue",
-                  line_width=3, annotation_text="FUTURES", row=3, col=2)
-
-    # ========================================================================
-    # CHART 7: ATM STRADDLE ANALYSIS (NEW!)
-    # ========================================================================
-    atm_strike = atm_info['atm_strike']
-    atm_call_premium = atm_info['atm_call_premium']
-    atm_put_premium = atm_info['atm_put_premium']
-    atm_straddle_premium = atm_info['atm_straddle_premium']
-
-    # Create straddle payoff diagram
-    strike_range = np.linspace(atm_strike * 0.90, atm_strike * 1.10, 100)
-
-    # Long straddle payoff at expiry
-    call_payoff = np.maximum(strike_range - atm_strike, 0) - atm_call_premium
-    put_payoff = np.maximum(atm_strike - strike_range, 0) - atm_put_premium
-    straddle_payoff = call_payoff + put_payoff
-
-    # Breakeven points
-    upper_breakeven = atm_strike + atm_straddle_premium
-    lower_breakeven = atm_strike - atm_straddle_premium
-
-    fig.add_trace(go.Scatter(x=strike_range, y=straddle_payoff,
-                             name='Straddle P&L',
-                             mode='lines', line=dict(color='purple', width=3),
-                             hovertemplate='<b>Price:</b> %{x:.0f}<br><b>P&L:</b> ₹%{y:.2f}<extra></extra>'),
-                  row=4, col=1)
-
-    fig.add_trace(go.Scatter(x=strike_range, y=call_payoff,
-                             name='Call P&L',
-                             mode='lines', line=dict(color='green', width=2, dash='dot'),
-                             hovertemplate='<b>Price:</b> %{x:.0f}<br><b>Call P&L:</b> ₹%{y:.2f}<extra></extra>'),
-                  row=4, col=1)
-
-    fig.add_trace(go.Scatter(x=strike_range, y=put_payoff,
-                             name='Put P&L',
-                             mode='lines', line=dict(color='red', width=2, dash='dot'),
-                             hovertemplate='<b>Price:</b> %{x:.0f}<br><b>Put P&L:</b> ₹%{y:.2f}<extra></extra>'),
-                  row=4, col=1)
-
-    # Add zero line
-    fig.add_hline(y=0, line_dash="dash", line_color="gray", line_width=1, row=4, col=1)
-
-    # Add ATM strike line
-    fig.add_vline(x=atm_strike, line_dash="solid", line_color="blue",
-                  line_width=2, annotation_text=f"ATM: {atm_strike}",
-                  row=4, col=1)
-
-    # Add breakeven lines
-    fig.add_vline(x=upper_breakeven, line_dash="dash", line_color="orange",
-                  line_width=2, annotation_text=f"Upper BE: {upper_breakeven:.0f}",
-                  row=4, col=1)
-    fig.add_vline(x=lower_breakeven, line_dash="dash", line_color="orange",
-                  line_width=2, annotation_text=f"Lower BE: {lower_breakeven:.0f}",
-                  row=4, col=1)
-
-    # Add current futures price
-    fig.add_vline(x=futures_ltp, line_dash="solid", line_color="red",
-                  line_width=2, annotation_text=f"Current: {futures_ltp:.0f}",
-                  row=4, col=1)
-
-    # Update axes
-    fig.update_xaxes(title_text="Net GEX (B)", row=1, col=1)
-    fig.update_xaxes(title_text="Net DEX (B)", row=1, col=2)
-    fig.update_xaxes(title_text="GEX Flow (B)", row=2, col=1)
-    fig.update_xaxes(title_text="DEX Flow (B)", row=2, col=2)
-    fig.update_xaxes(title_text="Pressure", row=3, col=1)
-    fig.update_xaxes(title_text="Combined (B)", row=3, col=2)
-    fig.update_xaxes(title_text="Underlying Price", row=4, col=1)
-
-    fig.update_yaxes(title_text="Strike", row=1, col=1)
-    fig.update_yaxes(title_text="Strike", row=1, col=2)
-    fig.update_yaxes(title_text="Strike", row=2, col=1)
-    fig.update_yaxes(title_text="Strike", row=2, col=2)
-    fig.update_yaxes(title_text="Strike", row=3, col=1)
-    fig.update_yaxes(title_text="Strike", row=3, col=2)
-    fig.update_yaxes(title_text="Profit/Loss (₹)", row=4, col=1)
-
-    timestamp = datetime.now().strftime('%H:%M:%S')
-    fig.update_layout(
-        title=dict(
-            text=f'<b>{symbol} - GEX + DEX Analysis (Futures: {futures_ltp:,.2f} via {fetch_method})</b><br>' +
-                 f'<sup>{timestamp} | GEX: {flow_metrics["gex_near_bias"]} | DEX: {flow_metrics["dex_near_bias"]} | ' +
-                 f'Combined: {flow_metrics["combined_bias"]} | ATM Straddle: ₹{atm_straddle_premium:.2f}</sup>',
-            font=dict(size=14)
-        ),
-        height=1600, showlegend=True, template='plotly_white', hovermode='closest'
-    )
-
-    fig.show()
 
 # ============================================================================
-# SECTION 3: TRADING STRATEGIES BASED ON LIVE SETUP
+# GAMMA FLIP ZONE DETECTION
 # ============================================================================
 
-def generate_trading_strategies(df, futures_ltp, flow_metrics, atm_info):
+def detect_gamma_flip_zones(df):
     """
-    Generate option trading strategies based on GEX+DEX analysis
-    MODIFIED: Updated interpretation based on new GEX flow logic
+    Detect gamma flip zones where GEX changes sign
+    These are areas of potential high volatility/instability
     """
-    print("\n" + "="*80)
-    print("💼 SECTION 3: OPTION TRADING STRATEGIES")
-    print("="*80)
-
-    # Get key levels
-    positive_gex_mask = df['Net_GEX_B'] > 0
-    positive_gex = df[positive_gex_mask].nlargest(5, 'Net_GEX_B')
-
-    supports_below = positive_gex[positive_gex['Strike'] < futures_ltp]
-    resistances_above = positive_gex[positive_gex['Strike'] > futures_ltp]
-
-    nearest_support = supports_below.iloc[0] if not supports_below.empty else None
-    nearest_resistance = resistances_above.iloc[0] if not resistances_above.empty else None
-
-    # Extract metrics
-    gex_bias = flow_metrics['gex_near_total']
-    dex_bias = flow_metrics['dex_near_total']
-    combined_signal = flow_metrics['combined_signal']
-
-    # ATM Straddle info
-    atm_strike = atm_info['atm_strike']
-    atm_straddle_premium = atm_info['atm_straddle_premium']
-
-    print(f"\n📊 MARKET SETUP ANALYSIS:")
-    print(f"{'Metric':<30} {'Value':>20} {'Bias':>35}")
-    print("-"*85)
-    print(f"{'GEX Flow (Near-term):':<30} {gex_bias:>20.2f} {flow_metrics['gex_near_bias']:>35}")
-    print(f"{'DEX Flow (Near-term):':<30} {dex_bias:>20.2f} {flow_metrics['dex_near_bias']:>35}")
-    print(f"{'Combined Signal:':<30} {combined_signal:>20.2f} {flow_metrics['combined_bias']:>35}")
-    print(f"{'ATM Strike:':<30} {atm_strike:>20,.0f}")
-    print(f"{'ATM Straddle Premium:':<30} {atm_straddle_premium:>20.2f}")
-
-    if nearest_support is not None:
-        support_strike = float(nearest_support['Strike'])
-        support_pct = ((futures_ltp - support_strike)/futures_ltp*100)
-        print(f"{'Nearest Support:':<30} {support_strike:>20,.0f} {support_pct:>34.2f}%")
-    if nearest_resistance is not None:
-        resistance_strike = float(nearest_resistance['Strike'])
-        resistance_pct = ((resistance_strike - futures_ltp)/futures_ltp*100)
-        print(f"{'Nearest Resistance:':<30} {resistance_strike:>20,.0f} {resistance_pct:>34.2f}%")
-
-    # ========================================================================
-    # STRATEGY SELECTION LOGIC (MODIFIED)
-    # ========================================================================
-    print("\n" + "="*80)
-    print("🎯 RECOMMENDED STRATEGIES:")
-    print("="*80)
-
-    strategies = []
-
-    # SCENARIO 1: Strong Positive GEX (>50) - Sideways to Bullish
-    if gex_bias > 50:
-        print("\n📌 PRIMARY STRATEGY: SIDEWAYS TO BULLISH SETUP (Strong Positive GEX)")
-        print("-"*75)
-
-        if nearest_support is not None and nearest_resistance is not None:
-            # Iron Condor
-            strategies.append({
-                'name': '🦅 Iron Condor',
-                'rationale': 'Strong positive GEX → Sideways movement expected, sell premium',
-                'setup': f"Sell {int(futures_ltp)} CE + Buy {int(resistance_strike)} CE | " +
-                         f"Sell {int(futures_ltp)} PE + Buy {int(support_strike)} PE",
-                'max_profit': 'Net Premium Received',
-                'max_loss': 'Limited to strike width minus premium',
-                'risk_level': '⚠️ MODERATE',
-                'conditions': 'Hold if price stays between support and resistance'
-            })
-
-            # Bull Call Spread (if DEX also positive)
-            if dex_bias > 0:
-                strategies.append({
-                    'name': '📈 Bull Call Spread',
-                    'rationale': 'Positive GEX + Bullish DEX → Mild upside with limited risk',
-                    'setup': f"Buy {int(futures_ltp)} CE + Sell {int(resistance_strike)} CE",
-                    'max_profit': 'Strike width - Premium',
-                    'max_loss': 'Premium Paid',
-                    'risk_level': '✅ LOW-MODERATE',
-                    'conditions': 'Bullish bias within resistance zone'
-                })
-
-        # Straddle selling (for high positive GEX)
-        strategies.append({
-            'name': '🔒 Short ATM Straddle',
-            'rationale': 'Strong positive GEX → Low volatility, collect premium',
-            'setup': f"Sell {int(atm_strike)} CE + Sell {int(atm_strike)} PE (ATM Straddle: ₹{atm_straddle_premium:.2f})",
-            'max_profit': f'₹{atm_straddle_premium:.2f} per lot',
-            'max_loss': 'UNLIMITED (use stops or hedges)',
-            'risk_level': '⚠️⚠️ HIGH (Requires experience)',
-            'conditions': 'Price stays near ATM, low volatility persists'
-        })
-
-    # SCENARIO 2: Negative GEX (<-50) - Bearish & High Volatility
-    elif gex_bias < -50:
-        print("\n📌 PRIMARY STRATEGY: HIGH VOLATILITY EXPECTED (Negative GEX - Bearish)")
-        print("-"*75)
-
-        # Long Straddle
-        strategies.append({
-            'name': '🎭 Long ATM Straddle',
-            'rationale': 'Negative GEX → High volatility expected, buy options',
-            'setup': f"Buy {int(atm_strike)} CE + Buy {int(atm_strike)} PE (Cost: ₹{atm_straddle_premium:.2f})",
-            'max_profit': 'Unlimited (both directions)',
-            'max_loss': f'Premium Paid (₹{atm_straddle_premium:.2f})',
-            'risk_level': '⚠️ HIGH (Needs big move)',
-            'conditions': f'Price must move beyond ₹{atm_straddle_premium:.2f} to profit'
-        })
-
-        if dex_bias < -20:
-            # Bearish directional play
-            strategies.append({
-                'name': '📉 Long Put',
-                'rationale': 'Negative GEX + Bearish DEX → Downside breakout likely',
-                'setup': f"Buy {int(futures_ltp)} PE (ATM) or {int(futures_ltp - 100)} PE (OTM)",
-                'max_profit': 'Substantial (down to zero)',
-                'max_loss': 'Premium Paid',
-                'risk_level': '⚠️ HIGH (Limited to premium)',
-                'conditions': 'Breakdown below support expected'
-            })
-
-            strategies.append({
-                'name': '🐻 Bear Put Spread',
-                'rationale': 'Reduce cost while maintaining downside exposure',
-                'setup': f"Buy {int(futures_ltp)} PE + Sell {int(futures_ltp - 200)} PE",
-                'max_profit': 'Strike width - Premium',
-                'max_loss': 'Premium Paid',
-                'risk_level': '✅ MODERATE',
-                'conditions': 'Defined risk with bearish bias'
-            })
-        elif dex_bias > 20:
-            # Counter-trend opportunity
-            strategies.append({
-                'name': '🚀 Long Call (Counter-trend)',
-                'rationale': 'Negative GEX (volatility) + Bullish DEX → Upside volatility',
-                'setup': f"Buy {int(futures_ltp)} CE (ATM) or {int(futures_ltp + 100)} CE (OTM)",
-                'max_profit': 'Unlimited',
-                'max_loss': 'Premium Paid',
-                'risk_level': '⚠️ HIGH (Limited to premium)',
-                'conditions': 'Volatile upside breakout expected'
-            })
-
-    # SCENARIO 3: Mild GEX (-50 to +50) - Mixed signals
-    else:
-        print("\n📌 PRIMARY STRATEGY: CAUTIOUS APPROACH (Mixed Signals)")
-        print("-"*75)
-
-        if abs(dex_bias) > 20:
-            # Follow DEX bias
-            if dex_bias > 0:
-                strategies.append({
-                    'name': '📈 Bull Call Spread',
-                    'rationale': 'Neutral GEX but bullish DEX → Defined risk bullish play',
-                    'setup': f"Buy {int(futures_ltp)} CE + Sell {int(futures_ltp + 100)} CE",
-                    'max_profit': 'Strike width - Premium',
-                    'max_loss': 'Premium Paid',
-                    'risk_level': '✅ MODERATE',
-                    'conditions': 'Mild upside move expected'
-                })
+    flip_zones = []
+    
+    df_sorted = df.sort_values('Strike').reset_index(drop=True)
+    
+    for i in range(len(df_sorted) - 1):
+        current_gex = df_sorted.loc[i, 'Net_GEX_B']
+        next_gex = df_sorted.loc[i + 1, 'Net_GEX_B']
+        
+        # Check for sign change
+        if (current_gex > 0 and next_gex < 0) or (current_gex < 0 and next_gex > 0):
+            lower_strike = df_sorted.loc[i, 'Strike']
+            upper_strike = df_sorted.loc[i + 1, 'Strike']
+            
+            # Determine flip type
+            if current_gex > 0:
+                flip_type = "DAMPENING → AMPLIFYING"
             else:
-                strategies.append({
-                    'name': '📉 Bear Put Spread',
-                    'rationale': 'Neutral GEX but bearish DEX → Defined risk bearish play',
-                    'setup': f"Buy {int(futures_ltp)} PE + Sell {int(futures_ltp - 100)} PE",
-                    'max_profit': 'Strike width - Premium',
-                    'max_loss': 'Premium Paid',
-                    'risk_level': '✅ MODERATE',
-                    'conditions': 'Mild downside move expected'
-                })
-        else:
-            # Very uncertain
-            strategies.append({
-                'name': '⏸️ WAIT FOR CLARITY',
-                'rationale': 'Mixed signals from both GEX and DEX → No clear edge',
-                'setup': 'Stay in cash or small positions only',
-                'max_profit': 'N/A',
-                'max_loss': 'Opportunity cost',
-                'risk_level': '✅ ZERO RISK',
-                'conditions': 'Wait for stronger directional signals'
+                flip_type = "AMPLIFYING → DAMPENING"
+            
+            flip_zones.append({
+                'lower_strike': lower_strike,
+                'upper_strike': upper_strike,
+                'flip_type': flip_type,
+                'gex_below': current_gex,
+                'gex_above': next_gex
             })
+    
+    return flip_zones
 
-    # ========================================================================
-    # PRINT STRATEGIES
-    # ========================================================================
-    for idx, strategy in enumerate(strategies, 1):
-        print(f"\n{'='*75}")
-        print(f"STRATEGY #{idx}: {strategy['name']}")
-        print(f"{'='*75}")
-        print(f"{'Rationale:':<20} {strategy['rationale']}")
-        print(f"{'Setup:':<20} {strategy['setup']}")
-        print(f"{'Max Profit:':<20} {strategy['max_profit']}")
-        print(f"{'Max Loss:':<20} {strategy['max_loss']}")
-        print(f"{'Risk Level:':<20} {strategy['risk_level']}")
-        print(f"{'Conditions:':<20} {strategy['conditions']}")
-
-    # ========================================================================
-    # MODIFIED GEX INTERPRETATION
-    # ========================================================================
-    print("\n" + "="*80)
-    print("📖 MODIFIED GEX FLOW INTERPRETATION:")
-    print("="*80)
-    print("""
-✅ POSITIVE GEX FLOW (Sideways to Bullish):
-   • 5 closest strikes with positive Net GEX near spot
-   • Market makers delta hedge by BUYING underlying on dips
-   • Acts as price SUPPORT → sideways to bullish movement
-   • STRATEGY: Sell premium (Iron Condor, Credit Spreads, Short Straddle)
-
-❌ NEGATIVE GEX FLOW (Bearish & High Volatility):
-   • 5 closest strikes with negative Net GEX near spot
-   • Market makers delta hedge by SELLING underlying on rallies
-   • Acts as price RESISTANCE → bearish and volatile movement
-   • STRATEGY: Buy volatility (Long Straddle, Long Options)
-
-⚖️ NEUTRAL GEX:
-   • Balanced positive and negative GEX
-   • No strong hedging bias from market makers
-   • Follow DEX (Delta) bias for directional plays
-    """)
-
-    # ========================================================================
-    # RISK MANAGEMENT
-    # ========================================================================
-    print("\n" + "="*80)
-    print("⚠️ RISK MANAGEMENT RULES:")
-    print("="*80)
-    print(f"""
-1. 🛡️ POSITION SIZING:
-   • Never risk more than 2% of capital per trade
-   • For spreads: Risk defined by strike width minus premium
-   • For long options: Max loss = Premium paid
-   • For short straddles: USE STOP LOSSES or protective wings
-
-2. 🎯 ENTRY TIMING:
-   • Wait for price to approach key GEX support/resistance levels
-   • Enter when combined GEX+DEX bias aligns with your strategy
-   • Avoid trading during first 15 mins and last 30 mins
-
-3. 🚪 EXIT RULES:
-   • Take profit at 50-70% of max profit for spreads
-   • Use trailing stops for long options (20-30% of unrealized profit)
-   • Exit immediately if GEX/DEX bias changes significantly
-   • For short straddle: Exit if price moves > ₹{atm_straddle_premium*0.5:.2f} from ATM
-
-4. ⏰ TIME DECAY:
-   • Selling strategies: Theta works in your favor (premium decay)
-   • Buying strategies: Monitor theta - don't hold too close to expiry
-   • Weekly options: Higher gamma risk, faster decay
-
-5. 📊 MONITORING:
-   • Check GEX+DEX every 1-3 hours during market
-   • Watch for changes in flow metrics (OI changes)
-   • If combined bias flips, reassess positions immediately
-   • Monitor ATM straddle premium for volatility clues
-    """)
-
-    print("\n" + "="*80)
-    print("💡 IMPORTANT NOTES:")
-    print("="*80)
-    print("""
-• These strategies are based on CURRENT market structure
-• GEX/DEX levels change throughout the day
-• Always use stop losses and defined risk strategies
-• Past performance does not guarantee future results
-• Consult with a financial advisor before trading
-• Short straddles require experience and strict risk management
-    """)
-    print("="*80)
-
-    return strategies
 
 # ============================================================================
-# ENHANCED TABLE WITH DUAL FLOW
-# ============================================================================
-
-def create_enhanced_flow_table(df, futures_ltp, flow_metrics, atm_info):
-    """Enhanced table showing dual flow metrics with ATM straddle info"""
-
-    df_unique = df.drop_duplicates(subset=['Strike']).copy()
-
-    # Get 5 positive GEX strikes closest to spot
-    positive_gex_df = df_unique[df_unique['Net_GEX_B'] > 0].copy()
-    positive_gex_df['Distance'] = abs(positive_gex_df['Strike'] - futures_ltp)
-    positive_gex_strikes = positive_gex_df.nsmallest(5, 'Distance')
-
-    # Get 5 negative GEX strikes closest to spot
-    negative_gex_df = df_unique[df_unique['Net_GEX_B'] < 0].copy()
-    negative_gex_df['Distance'] = abs(negative_gex_df['Strike'] - futures_ltp)
-    negative_gex_strikes = negative_gex_df.nsmallest(5, 'Distance')
-
-    # Combine and sort
-    relevant_strikes = pd.concat([positive_gex_strikes, negative_gex_strikes]).sort_values('Strike')
-
-    table_data = []
-    for idx, row in relevant_strikes.iterrows():
-        strike = row['Strike']
-        position = "🔼 ABOVE" if strike > futures_ltp else "🔽 BELOW"
-        if abs(strike - futures_ltp) < 10:
-            position = "⚡ ATM"
-
-        net_gex = row['Net_GEX_B']
-        gex_indicator = f"🟢 +{net_gex:.4f}B" if net_gex > 0.001 else f"🔴 {net_gex:.4f}B" if net_gex < -0.001 else f"⚪ {net_gex:.4f}B"
-
-        net_dex = row['Net_DEX_B']
-        dex_indicator = f"🟢 +{net_dex:.4f}B" if net_dex > 0.001 else f"🔴 {net_dex:.4f}B" if net_dex < -0.001 else f"⚪ {net_dex:.4f}B"
-
-        table_data.append([
-            position, f"{strike:,.0f}", gex_indicator, dex_indicator,
-            f"{row['Total_Volume']:,.0f}",
-            f"{row['Call_OI']:,.0f}", f"{row['Put_OI']:,.0f}"
-        ])
-
-    headers = ['Position', 'Strike', 'Net GEX', 'Net DEX', 'Volume', 'Call OI', 'Put OI']
-
-    print("\n" + "="*120)
-    print("📋 GEX + DEX ANALYSIS - STRIKES NEAR FUTURES LTP")
-    print("="*120)
-    print(tabulate(table_data, headers=headers, tablefmt='fancy_grid'))
-
-    # Add dual flow summary
-    print("\n" + "="*120)
-    print("📊 DUAL FLOW ANALYSIS SUMMARY (GEX + DEX)")
-    print("="*120)
-
-    print(f"\n{'GEX METRICS:':<40} {'Near-Term':<25} {'Total (All)':<20}")
-    print("-"*85)
-    print(f"{'Positive GEX Flow:':<40} {flow_metrics['gex_near_positive']:>20.4f} B {flow_metrics['gex_total_positive']:>15.4f} B")
-    print(f"{'Negative GEX Flow:':<40} {flow_metrics['gex_near_negative']:>20.4f} B {flow_metrics['gex_total_negative']:>15.4f} B")
-    print(f"{'Net GEX Flow:':<40} {flow_metrics['gex_near_total']:>20.4f} B {flow_metrics['gex_total_all']:>15.4f} B")
-    print(f"{'GEX Bias:':<40} {flow_metrics['gex_near_bias']:>25} {flow_metrics['gex_total_bias']:>20}")
-
-    print(f"\n{'DEX METRICS:':<40} {'Near-Term':<25} {'Total (All)':<20}")
-    print("-"*85)
-    print(f"{'Positive DEX Flow:':<40} {flow_metrics['dex_near_positive']:>20.4f} B {flow_metrics['dex_total_positive']:>15.4f} B")
-    print(f"{'Negative DEX Flow:':<40} {flow_metrics['dex_near_negative']:>20.4f} B {flow_metrics['dex_total_negative']:>15.4f} B")
-    print(f"{'Net DEX Flow:':<40} {flow_metrics['dex_near_total']:>20.4f} B {flow_metrics['dex_total_all']:>15.4f} B")
-    print(f"{'DEX Bias:':<40} {flow_metrics['dex_near_bias']:>25} {flow_metrics['dex_total_bias']:>20}")
-
-    print(f"\n{'COMBINED SIGNAL:':<40} {flow_metrics['combined_signal']:>20.4f} B")
-    print(f"{'COMBINED BIAS:':<40} {flow_metrics['combined_bias']:>25}")
-
-    print(f"\n{'ATM STRADDLE INFO:':<40}")
-    print("-"*85)
-    print(f"{'ATM Strike:':<40} {atm_info['atm_strike']:>20,.0f}")
-    print(f"{'ATM Call Premium:':<40} ₹{atm_info['atm_call_premium']:>19.2f}")
-    print(f"{'ATM Put Premium:':<40} ₹{atm_info['atm_put_premium']:>19.2f}")
-    print(f"{'ATM Straddle Premium:':<40} ₹{atm_info['atm_straddle_premium']:>19.2f}")
-    print(f"{'Upper Breakeven:':<40} {atm_info['atm_strike'] + atm_info['atm_straddle_premium']:>20,.2f}")
-    print(f"{'Lower Breakeven:':<40} {atm_info['atm_strike'] - atm_info['atm_straddle_premium']:>20,.2f}")
-    print("="*120)
-
-    print("\n💡 MODIFIED INTERPRETATION:")
-    print(f"   • GEX (Gamma): {flow_metrics['gex_near_bias']}")
-    print(f"      └─ Positive GEX = Sideways/Bullish (Market makers support dips)")
-    print(f"      └─ Negative GEX = Bearish/Volatile (Market makers sell rallies)")
-    print(f"   • DEX (Delta): {flow_metrics['dex_near_bias']} → Directional bias")
-    print(f"   • Combined: {flow_metrics['combined_bias']} → Overall prediction")
-    print(f"   • ATM Straddle: ₹{atm_info['atm_straddle_premium']:.2f} → Volatility expectation")
-
-    if flow_metrics['gex_near_bias'] != flow_metrics['dex_near_bias']:
-        print(f"   ⚠️  DIVERGENCE: GEX and DEX showing different biases!")
-        print(f"       → GEX controls volatility/direction, DEX shows hedging flow")
-    print("="*120)
-
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
-
-def run_enhanced_analysis(symbol="NIFTY", strikes_range=12, expiry_index=0):
-    """Run enhanced GEX + DEX analysis with trading strategies"""
-
-    print(f"🚀 ENHANCED GEX + DEX ANALYSIS - {symbol}")
-    print(f"📊 Modified GEX Flow Logic + Delta Exposure + ATM Straddle Chart")
-    print("="*80)
-
-    calculator = EnhancedGEXDEXCalculator()
-    df, futures_ltp, fetch_method, atm_info = calculator.fetch_and_calculate_gex_dex(
-        symbol, strikes_range, expiry_index
-    )
-
-    if df is not None and atm_info is not None:
-        flow_metrics = calculate_dual_gex_dex_flow(df, futures_ltp)
-        create_enhanced_flow_table(df, futures_ltp, flow_metrics, atm_info)
-        create_enhanced_dashboard(df, futures_ltp, symbol, flow_metrics, fetch_method, atm_info)
-        generate_trading_strategies(df, futures_ltp, flow_metrics, atm_info)
-
-        filename = f"{symbol}_GEX_DEX_Analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        df.to_csv(filename, index=False)
-        print(f"\n💾 Data saved: {filename}")
-
-        return df, flow_metrics, atm_info
-    else:
-        print("❌ Analysis failed")
-        return None, None, None
-
-# ============================================================================
-# REAL-TIME MODE
-# ============================================================================
-
-def run_realtime_analysis(symbol="NIFTY", strikes_range=12, expiry_index=0,
-                          update_interval_seconds=180, max_iterations=None):
-    """Real-time mode with enhanced features"""
-
-    print("="*80)
-    print("🔴 REAL-TIME GEX + DEX ANALYSIS (MODIFIED)")
-    print("="*80)
-    print(f"📊 Symbol: {symbol}")
-    print(f"⏱️  Interval: {update_interval_seconds}s")
-    print(f"🛑 Stop: Ctrl+C")
-    print("="*80)
-
-    iteration = 0
-    try:
-        while True:
-            iteration += 1
-            try:
-                clear_output(wait=True)
-            except:
-                pass
-
-            print(f"\n{'='*80}")
-            print(f"🔄 UPDATE #{iteration} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            print("="*80)
-
-            df, flow_metrics, atm_info = run_enhanced_analysis(symbol, strikes_range, expiry_index)
-
-            if max_iterations and iteration >= max_iterations:
-                print(f"\n✅ Completed {iteration} updates")
-                break
-
-            print(f"\n⏳ Next update in {update_interval_seconds}s...")
-            time.sleep(update_interval_seconds)
-
-    except KeyboardInterrupt:
-        print(f"\n🛑 Stopped after {iteration} updates")
-
-# ============================================================================
-# EXECUTE
+# MAIN - FOR TESTING
 # ============================================================================
 
 if __name__ == "__main__":
-    SYMBOL = "NIFTY"
-    STRIKES_RANGE = 12
-    EXPIRY_INDEX = 0
-
-    # Single analysis
-    df, flow_metrics, atm_info = run_enhanced_analysis(SYMBOL, STRIKES_RANGE, EXPIRY_INDEX)
-
-    # Real-time (uncomment to use)
-    run_realtime_analysis(SYMBOL, STRIKES_RANGE, EXPIRY_INDEX, update_interval_seconds=60)
-
-    print("\n✅ MODIFIED ANALYSIS COMPLETE!")
-    print("\n" + "="*80)
-    print("📝 KEY MODIFICATIONS APPLIED:")
-    print("="*80)
-    print("""
-1. ✅ MODIFIED GEX FLOW CALCULATION:
-   - Positive GEX Flow = Sum of 5 strikes with POSITIVE Net GEX closest to spot
-   - Negative GEX Flow = Sum of 5 strikes with NEGATIVE Net GEX closest to spot
-   - Continuous strikes near the spot price
-
-2. ✅ UPDATED GEX INTERPRETATION:
-   - Positive GEX = Sideways to Bullish (MM support)
-   - Negative GEX = Bearish & High Volatility (MM resistance)
-
-3. ✅ NEW ATM STRADDLE CHART (7th Chart):
-   - Displays ATM straddle payoff diagram
-   - Shows breakeven points
-   - Includes Call, Put, and combined P&L
-   - Useful for volatility trading strategies
-
-4. ✅ ENHANCED TRADING STRATEGIES:
-   - Updated strategy recommendations based on new GEX logic
-   - Added short straddle strategies for high positive GEX
-   - Added long straddle strategies for negative GEX
-   - Included ATM straddle premium in all recommendations
-
-5. ✅ ALL ORIGINAL FEATURES RETAINED:
-   - Delta Exposure (DEX) Analysis
-   - Volume overlay on all 6 main charts
-   - Combined GEX + DEX bias
-   - Trading strategies generation
-   - Risk management rules
-   - Real-time mode
-""")
-    print("="*80)
+    print("=" * 60)
+    print("NYZTrade - Enhanced GEX + DEX Calculator")
+    print("=" * 60)
+    
+    calculator = EnhancedGEXDEXCalculator()
+    
+    for symbol in ['NIFTY', 'BANKNIFTY']:
+        print(f"\n📊 Fetching {symbol}...")
+        
+        df, futures_ltp, fetch_method, atm_info = calculator.fetch_and_calculate_gex_dex(
+            symbol=symbol,
+            strikes_range=10,
+            expiry_index=0
+        )
+        
+        if df is not None:
+            print(f"✅ Futures: ₹{futures_ltp:,.2f} ({fetch_method})")
+            print(f"   ATM Strike: {atm_info['atm_strike']}")
+            print(f"   Straddle: ₹{atm_info['atm_straddle_premium']:.2f}")
+            print(f"   Expiry: {atm_info['expiry_date']}")
+            
+            flow = calculate_dual_gex_dex_flow(df, futures_ltp)
+            print(f"   GEX Bias: {flow['gex_near_bias']}")
+            print(f"   DEX Bias: {flow['dex_near_bias']}")
+            print(f"   Combined: {flow['combined_bias']}")
+            
+            flips = detect_gamma_flip_zones(df)
+            if flips:
+                print(f"   ⚡ {len(flips)} Gamma Flip Zone(s)")
+        else:
+            print(f"❌ Failed to fetch data")
+    
+    print("\n" + "=" * 60)
